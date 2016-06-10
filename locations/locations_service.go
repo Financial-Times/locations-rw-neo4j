@@ -2,7 +2,7 @@ package locations
 
 import (
 	"encoding/json"
-
+	"fmt"
 	"github.com/Financial-Times/neo-utils-go/neoutils"
 	"github.com/jmcvetta/neoism"
 )
@@ -20,18 +20,21 @@ func NewCypherLocationsService(cypherRunner neoutils.CypherRunner, indexManager 
 
 func (s service) Initialise() error {
 	return neoutils.EnsureConstraints(s.indexManager, map[string]string{
-		"Thing":   "uuid",
-		"Concept": "uuid",
-		"Location":   "uuid"})
+		"Thing":         "uuid",
+		"Concept":       "uuid",
+		"Location":      "uuid",
+		"TMEIdentifier": "value",
+		"UPPIdentifier": "value"})
 }
 
 func (s service) Read(uuid string) (interface{}, bool, error) {
 	results := []Location{}
 
 	query := &neoism.CypherQuery{
-		Statement: `MATCH (n:Location {uuid:{uuid}}) return n.uuid
-		as uuid, n.canonicalName as canonicalName,
-		n.tmeIdentifier as tmeIdentifier`,
+		Statement: `MATCH (n:Location {uuid:{uuid}})
+OPTIONAL MATCH (upp:UPPIdentifier)-[:IDENTIFIES]->(n)
+OPTIONAL MATCH (tme:TMEIdentifier)-[:IDENTIFIES]->(n)
+return distinct n.uuid as uuid, n.prefLabel as prefLabel, labels(n) as types, {uuids:collect(distinct upp.value), TME:collect(distinct tme.value)} as alternativeIdentifiers`,
 		Parameters: map[string]interface{}{
 			"uuid": uuid,
 		},
@@ -53,50 +56,77 @@ func (s service) Read(uuid string) (interface{}, bool, error) {
 
 func (s service) Write(thing interface{}) error {
 
-	sub := thing.(Location)
+	location := thing.(Location)
 
-	params := map[string]interface{}{
-		"uuid": sub.UUID,
+	//cleanUP all the previous IDENTIFIERS referring to that uuid
+	deletePreviousIdentifiersQuery := &neoism.CypherQuery{
+		Statement: `MATCH (t:Thing {uuid:{uuid}})
+		OPTIONAL MATCH (t)<-[iden:IDENTIFIES]-(i)
+		DELETE iden, i`,
+		Parameters: map[string]interface{}{
+			"uuid": location.UUID,
+		},
 	}
 
-	if sub.CanonicalName != "" {
-		params["canonicalName"] = sub.CanonicalName
-		params["prefLabel"] = sub.CanonicalName
-	}
-
-	if sub.TmeIdentifier != "" {
-		params["tmeIdentifier"] = sub.TmeIdentifier
-	}
-
-	query := &neoism.CypherQuery{
+	//create-update node for Location
+	createLocationQuery := &neoism.CypherQuery{
 		Statement: `MERGE (n:Thing {uuid: {uuid}})
 					set n={allprops}
 					set n :Concept
 					set n :Location
 		`,
 		Parameters: map[string]interface{}{
-			"uuid":     sub.UUID,
-			"allprops": params,
+			"uuid": location.UUID,
+			"allprops": map[string]interface{}{
+				"uuid":      location.UUID,
+				"prefLabel": location.PrefLabel,
+			},
 		},
 	}
 
-	return s.cypherRunner.CypherBatch([]*neoism.CypherQuery{query})
+	queryBatch := []*neoism.CypherQuery{deletePreviousIdentifiersQuery, createLocationQuery}
 
+	//ADD all the IDENTIFIER nodes and IDENTIFIES relationships
+	for _, alternativeUUID := range location.AlternativeIdentifiers.TME {
+		alternativeIdentifierQuery := createNewIdentifierQuery(location.UUID, tmeIdentifierLabel, alternativeUUID)
+		queryBatch = append(queryBatch, alternativeIdentifierQuery)
+	}
+
+	for _, alternativeUUID := range location.AlternativeIdentifiers.UUIDS {
+		alternativeIdentifierQuery := createNewIdentifierQuery(location.UUID, uppIdentifierLabel, alternativeUUID)
+		queryBatch = append(queryBatch, alternativeIdentifierQuery)
+	}
+
+	return s.cypherRunner.CypherBatch(queryBatch)
+}
+
+func createNewIdentifierQuery(uuid string, identifierLabel string, identifierValue string) *neoism.CypherQuery {
+	statementTemplate := fmt.Sprintf(`MERGE (t:Thing {uuid:{uuid}})
+					CREATE (i:Identifier {value:{value}})
+					MERGE (t)<-[:IDENTIFIES]-(i)
+					set i : %s `, identifierLabel)
+	query := &neoism.CypherQuery{
+		Statement: statementTemplate,
+		Parameters: map[string]interface{}{
+			"uuid":  uuid,
+			"value": identifierValue,
+		},
+	}
+	return query
 }
 
 func (s service) Delete(uuid string) (bool, error) {
 	clearNode := &neoism.CypherQuery{
 		Statement: `
 			MATCH (t:Thing {uuid: {uuid}})
+			OPTIONAL MATCH (t)<-[iden:IDENTIFIES]-(i:Identifier)
 			REMOVE t:Concept
 			REMOVE t:Location
-			SET t={props}
+			DELETE iden, i
+			SET t={uuid:{uuid}}
 		`,
 		Parameters: map[string]interface{}{
 			"uuid": uuid,
-			"props": map[string]interface{}{
-				"uuid": uuid,
-			},
 		},
 		IncludeStats: true,
 	}
